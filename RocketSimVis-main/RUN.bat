@@ -1,2 +1,2 @@
-python %0\..\src\main.py
+py -3.13 %0\..\src\main.py
 pause
