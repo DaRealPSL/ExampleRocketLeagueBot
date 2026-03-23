@@ -5,7 +5,7 @@ Reinforcement learning training script for a Rocket League bot using RLGym v2
 and RLGym-PPO. Defines the renderer, state mutators, reward functions, and
 the main training entry point.
  
-Training is structured in progressive stages (1 -> 1.5 -> 2 -> 2.5 -> 3),
+Training is structured in progressive stages (1 -> 1.25 -> 1.5 -> 2 -> 2.25 -> 2.5 -> 3),
 gradually shifting the reward signal from basic navigation to goal-scoring
 and game-sense behaviours as the agent accumulates experience.
 """
@@ -15,7 +15,11 @@ import json
 import socket
 import torch
 import numpy as np
+import warnings
+import functools
 from typing import List, Dict, Any
+
+from ClassDeprecation import deprecated_class
 
 from rlgym.api import RewardFunction, AgentID, Renderer, StateMutator, RLGym
 from rlgym.rocket_league.api import GameState, Car
@@ -40,7 +44,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 #=========================================
-# Renderer
+# @section: Renderer
 #=========================================
 
 # Default UDP target for RocketSimVis — localhost on a fixed port.
@@ -135,9 +139,10 @@ class RocketSimVisRenderer(Renderer[GameState]):
         # Nothing to clean up as the OS will reclaim the socket on exit
         pass
 
+# @endsection
 
 #=========================================
-# State Setters
+# @section: State Setters
 #=========================================
 
 class RandomPhysicsMutator(StateMutator[GameState]):  
@@ -210,19 +215,100 @@ class RandomStateMutator(StateMutator[GameState]):
     def __init__(self):
         self.mutator = WeightedSampleMutator.from_zipped(
             (KickoffMutator(), 0.6),        # Standard kickoff - keep it grounded.
-            (RandomPhysicsMutator(), 0.4)   # Chaos mode - anything goes.
+            (RandomPhysicsMutator(), 0.4),  # Chaos mode - anything goes.
+            (AerialMutator(), 0.2)          # 20% of resets are high aerials.
         )
 
     def apply(self, state: GameState, shared_info: Dict[str, Any]) -> None:
         self.mutator.apply(state, shared_info)
 
+# Yeah hate me for it but I had a bug so AI wrote this.
+# Sue me.
+class AerialMutator(StateMutator[GameState]):
+    # --- Tunable Constants ---
+    BALL_X_RANGE = (-1000, 1000)
+    BALL_Y_RANGE = (-1500, 1500)
+    BALL_Z_RANGE = (1000, 1400)      # Lowered max Z to prevent instant ceiling hits
+    BALL_VZ_RANGE = (400, 800)       # Adjusted to keep ball in play longer
+    CAR_Y_OFFSET_RANGE = (1500, 2500)
+    CAR_INITIAL_SPEED = 800.0
+    CAR_REST_Z = 17.0
+    EPSILON = 1e-8
+
+    def apply(self, state: GameState, shared_info: Dict[str, Any]) -> None:
+        assert state.cars, "AerialMutator requires at least one car"
+
+        # 1. Spawn Ball
+        ball_x = np.random.uniform(*self.BALL_X_RANGE)
+        ball_y = np.random.uniform(*self.BALL_Y_RANGE)
+        ball_z = np.random.uniform(*self.BALL_Z_RANGE)
+
+        state.ball.position = np.array([ball_x, ball_y, ball_z])
+        state.ball.linear_velocity = np.array([
+            np.random.uniform(-200, 200),
+            np.random.uniform(-200, 200),
+            np.random.uniform(*self.BALL_VZ_RANGE)
+        ])
+        state.ball.angular_velocity = np.zeros(3)
+
+        # 2. Spawn Cars
+        for agent, car in state.cars.items():
+            side = -1 if not car.is_orange else 1
+            
+            # Position relative to ball
+            car_x = ball_x + np.random.uniform(-500, 500)
+            car_y = ball_y + (np.random.uniform(*self.CAR_Y_OFFSET_RANGE) * side)
+            
+            car.physics.position = np.array([car_x, car_y, self.CAR_REST_Z])
+            
+            # Rotation and Velocity
+            target_pos = state.ball.position
+            car_pos = car.physics.position
+            
+            if np.linalg.norm(target_pos - car_pos) > self.EPSILON:
+                # Use the robust look_at logic
+                car.physics.rotation_mtx = self.safe_look_at(car_pos, target_pos)
+                
+                # Momentum toward ball
+                forward_vec = car.physics.rotation_mtx[:, 0] # Extract forward from column
+                car.physics.linear_velocity = forward_vec * self.CAR_INITIAL_SPEED
+            else:
+                # Fallback to identity matrix if car/ball are overlapping
+                car.physics.rotation_mtx = np.eye(3)
+                car.physics.linear_velocity = np.zeros(3)
+
+            car.physics.angular_velocity = np.zeros(3)
+            car.boost_amount = 1.0
+
+    def safe_normalize(self, v):
+        norm = np.linalg.norm(v)
+        return v / (norm + self.EPSILON)
+
+    def safe_look_at(self, source, target):
+        forward = self.safe_normalize(target - source)
+        world_up = np.array([0.0, 0.0, 1.0])
+
+        # Handle degenerate case where car is directly under ball
+        if abs(np.dot(forward, world_up)) > 0.99:
+            world_up = np.array([0.0, 1.0, 0.0])
+
+        right = self.safe_normalize(np.cross(world_up, forward))
+        up = self.safe_normalize(np.cross(forward, right))
+
+        # RLGym 2 / RocketSim: Column 0=F, 1=R, 2=U
+        return np.column_stack([forward, right, up])
+
+# @endsection
 
 #=========================================
-# Rewards
+# @section: Rewards
 #=========================================
 
+@deprecated_class("AdvancedTouchReward is deprecated. Use StableTouchReward instead.")
 class AdvancedTouchReward(RewardFunction[AgentID, GameState, float]):
     """
+    [DEPRECATED] Use StableTouchReward instead.
+
     Rewards the agent for making contact with the ball, with an optional bonus
     proportional to the acceleration imparted on impact.
  
@@ -266,6 +352,24 @@ class AdvancedTouchReward(RewardFunction[AgentID, GameState, float]):
         # Must copy here too -- same reference-vs-copy pitfall as in reset()
         self.prev_ball_vel = ball_vel.copy()
         return rewards
+
+
+class StableTouchReward(RewardFunction[AgentID, GameState, float]):
+    """
+    A simple, bulletproof touch reward (I hope).
+    Grants a flat reward if the agent touches the ball during the step.
+    Removes delta-v calculations to prevent the "Wall Pinch" reward exploit.
+    """
+    def __init__(self, touch_reward: float = 1.0):
+        self.touch_reward = touch_reward
+
+    def reset(self, agents: List[AgentID], initial_state: GameState, shared_info: Dict[str, Any]) -> None:
+        pass
+
+    def get_rewards(self, agents: List[AgentID], state: GameState, is_terminated: Dict[AgentID, bool],
+                    is_truncated: Dict[AgentID, bool], shared_info: Dict[str, Any]) -> Dict[AgentID, float]:
+        
+        return {agent: self.touch_reward if state.cars[agent].ball_touches > 0 else 0.0 for agent in agents}
 
 
 class FaceBallReward(RewardFunction):
@@ -465,6 +569,98 @@ class EventReward(RewardFunction[AgentID, GameState, float]):
         return rewards
 
 
+class RecoveryReward(RewardFunction[AgentID, GameState, float]):
+    """
+    Grants a continuous reward based on how 'flat' the car lands.
+    1.0 for perfect, 0.0 for landing on the side/roof.
+    """
+    def __init__(self):
+        self.was_in_air = {}
+
+    def reset(self, agents: List[AgentID], initial_state: GameState, shared_info: Dict[str, Any]) -> None:
+        self.was_in_air = {agent: not initial_state.cars[agent].on_ground for agent in agents}
+
+    def get_rewards(self, agents: List[AgentID], state: GameState, is_terminated: Dict[AgentID, bool],
+                    is_truncated: Dict[AgentID, bool], shared_info: Dict[str, Any]) -> Dict[AgentID, float]:
+        rewards = {}
+        for agent in agents:
+            car = state.cars[agent]
+            currently_in_air = not car.on_ground
+            
+            if self.was_in_air.get(agent, False) and not currently_in_air:
+                # max(0, up[2]) means a perfect landing is 1.0, 90-degrees is 0.0
+                rewards[agent] = max(0.0, float(car.physics.up[2]))
+            else:
+                rewards[agent] = 0.0
+                
+            self.was_in_air[agent] = currently_in_air
+            
+        return rewards
+
+
+class OutOfPositionPenalty(RewardFunction[AgentID, GameState, float]):
+    """
+    A smooth gradient penalty. Barely penalizes close follow-ups, 
+    but heavily penalizes camping on the wrong side of the ball.
+    """
+    def reset(self, agents: List[AgentID], initial_state: GameState, shared_info: Dict[str, Any]) -> None:
+        pass
+
+    def get_rewards(self, agents: List[AgentID], state: GameState, is_terminated: Dict[AgentID, bool],
+                    is_truncated: Dict[AgentID, bool], shared_info: Dict[str, Any]) -> Dict[AgentID, float]:
+        rewards = {}
+        for agent in agents:
+            car = state.cars[agent]
+            ball_y = state.ball.position[1]
+            car_y = car.physics.position[1]
+            
+            # Calculate how far "ahead" of the ball the car is
+            if car.is_orange:
+                distance_ahead = max(0.0, ball_y - car_y)
+            else:
+                distance_ahead = max(0.0, car_y - ball_y)
+                
+            # Scale the penalty: 1000 units ahead = -0.01 penalty. 
+            # It's a gentle slope, not a brick wall.
+            rewards[agent] = -0.01 * (distance_ahead / 1000.0)
+                
+        return rewards
+
+
+class BoostEfficiencyReward(RewardFunction[AgentID, GameState, float]):
+    """
+    Rewards holding boost, but penalizes using boost
+    when the car is already at or near max speed (supersonic).
+    """
+    def __init__(self):
+        self.last_boost = {}
+
+    def reset(self, agents: List[AgentID], initial_state: GameState, shared_info: Dict[str, Any]) -> None:
+        self.last_boost = {a: initial_state.cars[a].boost_amount for a in agents}
+
+    def get_rewards(self, agents: List[AgentID], state: GameState, is_terminated: Dict[AgentID, bool],
+                    is_truncated: Dict[AgentID, bool], shared_info: Dict[str, Any]) -> Dict[AgentID, float]:
+        rewards = {}
+
+        for agent in agents:
+            car = state.cars[agent]
+            current_boost = car.boost_amount
+            speed = np.linalg.norm(car.physics.linear_velocity)
+
+            # Calculate passive reward for having boost (sqrt scale)
+            boost_spent = max(0.0, self.last_boost.get(agent, 0.0) - current_boost)
+
+            # Gentle passive reward for having boost (sqrt scale)
+            reward = float(np.sqrt(current_boost)) * 0.02
+
+            # Supersonic is ~2200. If they are boosting while > 2100, they are wasting it.
+            if boost_spent > 0 and speed > 2100:
+                reward -= boost_spent * 2.0 # penalty for waste
+
+        return rewards
+
+# @endsection
+
 #=========================================
 # Training Script
 #=========================================
@@ -518,37 +714,86 @@ def build_rlgym_v2_env():
     #       switching from Stage 1 to Stage 2 after ~100M timesteps
     #       completely collapses the model. So we're implementing
     #       "bridge" stages to (hopefully) avoid this.
+    # UPDATE: it didn't work
+
+    # ---------------------------------------------------------
+    # STAGE 1.25: Ugh.
+    # NOTE: Make sure that the `policy_lr` and `critic_lr` are
+    #       both set to 1.5e-4 and NOT 1e-4 or anything else :3
+    # ---------------------------------------------------------
+    # reward_fn = CombinedReward(
+    #     (InAirReward(), 0.1),
+    #     (SpeedTowardBallReward(), 5.0), 
+    #     (FaceBallReward(), 1.2),        
+    #     (VelocityBallToGoalReward(), 8.0), 
+    #     (StableTouchReward(touch_reward=15.0), 1.0), # The new, exploit-free (hopefully) touch reward
+    #     (GoalReward(), 100.0), 
+    #     (EventReward(concede=-1.0), 5.0)
+    # )
 
     # ---------------------------------------------------------
     # STAGE 1.5: Whoopsies!
     # NOTE: Make sure that the `policy_lr` and `critic_lr` are
     #       both set to 2e-4 and NOT 1e-4 :3
     # ---------------------------------------------------------
-    reward_fn = CombinedReward(
-        (InAirReward(), 0.1),
-        (SpeedTowardBallReward(), 3.0), # Less, but still a strong breadcrumb
-        (FaceBallReward(), 1.0),        # Just the same :P
-        (VelocityBallToGoalReward(), 10.0), # The new goal - get the ball moving toward net
-        (AdvancedTouchReward(touch_reward=0.5, acceleration_reward=2.0), 25.0),
-        (GoalReward(), 100.0), # MASSIVE incentive to score
-        (EventReward(concede=-5.0), 10.0)
-    )
-
+    # reward_fn = CombinedReward(
+    #     (InAirReward(), 0.1),
+    #     (SpeedTowardBallReward(), 2.0),      # Fading: Was 5.0
+    #     (FaceBallReward(), 0.6),             # Fading: Was 1.2
+    #     (VelocityBallToGoalReward(), 20.0),  # BOOSTED: Directing the ball is priority #1
+    #     (StableTouchReward(touch_reward=8.0), 1.0), # Lowered: Touches are common now
+    #     (GoalReward(), 200.0),               # DOUBLED: Scoring is the ultimate win
+    #     (EventReward(concede=-10.0), 5.0)    # INCREASED: Stronger punishment for conceding
+    # )
+    
     # ---------------------------------------------------------
-    # STAGE 2: < 1_000_000_000 Steps
+    # STAGE 1.75: I'm getting tired of this.
     # ---------------------------------------------------------
     # reward_fn = CombinedReward(
-    #     (InAirReward(), 0.05),  
-    #     (SpeedTowardBallReward(), 0.5), # Lowered this so it doesn't just "chase"
-    #     (FaceBallReward(), 0.5),
-    #     (VelocityBallToGoalReward(), 8.0), # The "Direction" reward
-    #     (AdvancedTouchReward(touch_reward=0.0, acceleration_reward=3.0), 10.0), 
-    #     (GoalReward(), 50.0),  # INCREASED: Make scoring the ultimate "win"
-    #     (EventReward(concede=-2.0), 10.0) # LOWERED: Make them less "afraid" to reset the game
+    #     (InAirReward(), 0.1),
+    #     (SpeedTowardBallReward(), 0.5),      # SLASHED: Force Blue to find a new path
+    #     (FaceBallReward(), 0.3),             # SLASHED: No more "staring" points
+    #     (VelocityBallToGoalReward(), 15.0),  # SLIGHTLY LOWERED: Still good, but not a salary
+    #     (StableTouchReward(touch_reward=2.0), 1.0), # CRIPPLED: Touches are now just breadcrumbs
+    #     (GoalReward(), 1500.0),              # MASSIVE BOOST: One goal > 2 minutes of circling
+    #     (EventReward(concede=-20.0), 10.0)   # INCREASED
     # )
 
     # ---------------------------------------------------------
-    # STAGE 2.5: < 500_000_000 - 800_000_000
+    # STAGE 1.85: The Polish (Fixing positioning, landings, and boost)
+    #             < 500_000_000
+    # ---------------------------------------------------------
+    # reward_fn = CombinedReward(
+    #     (InAirReward(), 0.02),                # Lowered: Stop jumping just to land!
+    #     (RecoveryReward(), 4.0),              # Lowered & Smoothed: Nice landings are a bonus, not a career
+    #     (OutOfPositionPenalty(), 1.0),        # Smoothed: Bot won't be scared to push anymore
+    #     (SaveBoostReward(), 0.5),             # NEW: Teach them to hold onto the shiny yellow juice
+    #     (SpeedTowardBallReward(), 0.5), 
+    #     (VelocityBallToGoalReward(), 20.0), 
+    #     (StableTouchReward(touch_reward=5.0), 1.0), 
+    #     (GoalReward(), 1500.0), 
+    #     (EventReward(concede=-20.0), 10.0)
+    # )
+
+    # ---------------------------------------------------------
+    # STAGE 2.0: Efficiency & Aerial Era (500M - 800M)
+    # ---------------------------------------------------------
+    reward_fn = CombinedReward(
+        (BoostEfficiencyReward(), 2.0),       # NEW: Penalize supersonic boost waste
+        (AirTouchReward(min_height=300), 5.0),# NEW: Actually reward leaving the ground
+        (VelocityBallToGoalReward(), 15.0),   # Main driver of game-sense
+        (GoalReward(), 1500.0),               # The ultimate objective
+        (EventReward(concede=-20.0), 10.0),   # The ultimate penalty
+        
+        # --- THE NERFED CRUTCHES ---
+        (RecoveryReward(), 0.5),              # Was 4.0. You know how to land, stop farming it.
+        (OutOfPositionPenalty(), 0.2),        # Was 1.0. Just a tiny reminder to rotate.
+        (StableTouchReward(touch_reward=1.0), 0.5), # Slashed. Touches must have a purpose now.
+        (SpeedTowardBallReward(), 0.1),       # Barely exists, just breaks midfield paralysis.
+    )
+
+    # ---------------------------------------------------------
+    # STAGE 2.5
     # ---------------------------------------------------------
     # reward_fn = CombinedReward(
     #     (InAirReward(), 0.05),
@@ -631,17 +876,17 @@ if __name__ == "__main__":
         n_proc=n_proc,
         min_inference_size=min_inference_size,
         metrics_logger=None,            # Swap in a WandB/custom logger here if desired
-        ppo_batch_size=100_000,         # Total steps collected before each PPO update
-        ts_per_iteration=100_000,       # FIX: Must match ppo_batch_size
+        ppo_batch_size=200_000,         # Total steps collected before each PPO update
+        ts_per_iteration=200_000,       # FIX: Must match ppo_batch_size
         exp_buffer_size=300_000,        # Experience replay buffer capacity
         ppo_minibatch_size=50_000,      # Mini-batch size within each PPO epoch
-        ppo_ent_coef=0.01,              # FIX: Entropy coefficient -- golden value per guide
+        ppo_ent_coef=0.005,              # FIX: Entropy coefficient -- golden value per guide
         ppo_epochs=2,                   # FIX: Low epoch count per guide to prevent overfitting
         policy_layer_sizes=[512, 512, 512],  # Three-layer MLP for the policy network
         critic_layer_sizes=[512, 512, 512],  # Matching architecture for the value network
-        policy_lr=2e-4,                 # FIX: 2e-4 Early, drop to 1e-4 Mid, 0.8e-4 Lat
-        critic_lr=2e-4,                 # Kept in sync with policy_lr for now
-        render=False,                   # FIX: Rendering MUST be False during training to preserve SPS
+        policy_lr=5e-5,                 # FIX: 2e-4 Early, drop to 1e-4 Mid, 0.8e-4 Later
+        critic_lr=5e-5,                 # Kept in sync with policy_lr for now
+        render=True,                    # FIX: Rendering MUST be False during training to preserve SPS
         gae_gamma=0.995,                # High discount factor as we care about long-term reward
         n_checkpoints_to_keep=1000,     # Keep plenty of checkpoints for rollback if needed
         render_delay=0.047,             # Target ~21fps during visualisation runs
